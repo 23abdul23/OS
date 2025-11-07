@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C Code Display</title>
+  <style>
+    body {
+      background-color: #0d1117;
+      color: #e6edf3;
+      font-family: "Fira Code", monospace;
+      padding: 20px;
+    }
+    pre {
+      background-color: #161b22;
+      border-radius: 8px;
+      padding: 20px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 14px;
+      line-height: 1.5;
+      overflow-x: auto;
+    }
+    code {
+      color: #79c0ff;
+    }
+  </style>
+</head>
+<body>
+  <h2>Example of Inter-Process Communication using Shared Memory in C</h2>
+  <pre><code>
+// Example of Inter-Process Communication using Shared Memory in C
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/types.h&gt; //fork()
+#include &lt;ctype.h&gt; //toupper()
+#include &lt;sys/ipc.h&gt; //IPC key constants
+#include &lt;sys/shm.h&gt; //shmget(), shmat(), shmdt()
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt; //strcpy()
+#include "cJSON.h" // Assuming cJSON.h is in your include path
+
+#define SHM_SIZE 1024
+
+int main() {
+    int shmid = shmget(IPC_PRIVATE, SHM_SIZE, 0666);
+    char *shm;
+    FILE *fp;
+    long lSize;
+    char *buffer;
+
+    if (fork() == 0) {
+        shm = shmat(shmid, NULL, 0);
+        // busy wait
+        while (shm[0] == '\0'); // wait until parent writes
+
+        printf("%s", shm);
+        shmdt(shm);
+        exit(0);
+    } else { // Parent: write & print
+        shm = shmat(shmid, NULL, 0);
+
+        fp = fopen("data.json", "rb"); // Open the file in binary read mode
+        if (!fp) {
+            perror("Error opening file");
+            return 1;
+        }
+
+        fseek(fp, 0L, SEEK_END);
+        lSize = ftell(fp);
+        rewind(fp);
+
+        buffer = (char*) malloc(lSize + 1);
+        if (!buffer) {
+            fclose(fp);
+            perror("Memory allocation failed");
+            return 1;
+        }
+
+        if (fread(buffer, lSize, 1, fp) != 1) {
+            fclose(fp);
+            free(buffer);
+            perror("Error reading file");
+            return 1;
+        }
+
+        buffer[lSize] = '\0';
+        fclose(fp);
+
+        strcpy(shm, buffer);
+        free(buffer);
+        shmdt(shm);
+    }
+
+    return 0;
+}
+
+
+
+//good counter using mutex and semaphore
+#include <pthread.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define NITER 1000000
+pthread_mutex_t mutex;
+int cnt = 0;
+
+void * Count(void * a)
+{
+    int i, tmp;
+    pthread_mutex_lock(&mutex);
+    for(i = 0; i < NITER; i++)
+    {
+        tmp = cnt;      /* copy the global cnt locally */
+        tmp = tmp+1;    /* increment the local copy */
+        cnt = tmp;      /* store the local value into the global cnt */ 
+    }
+    pthread_mutex_unlock(&mutex);
+}
+
+int main(int argc, char * argv[])
+{
+    pthread_t tid1, tid2;
+    pthread_mutex_init(&mutex,NULL);
+    if(pthread_create(&tid1, NULL, Count, NULL))
+    {
+      printf("\n ERROR creating thread 1");
+      exit(1);
+    }
+
+    if(pthread_create(&tid2, NULL, Count, NULL))
+    {
+      printf("\n ERROR creating thread 2");
+      exit(1);
+    }
+
+    if(pthread_join(tid1, NULL))	/* wait for the thread 1 to finish */
+    {
+      printf("\n ERROR joining thread");
+      exit(1);
+    }
+
+    if(pthread_join(tid2, NULL))        /* wait for the thread 2 to finish */
+    {
+      printf("\n ERROR joining thread");
+      exit(1);
+    }
+
+    if (cnt < 2 * NITER) 
+        printf("\n BOOM! cnt is [%d], should be %d\n", cnt, 2*NITER);
+    else
+        printf("\n OK! cnt is [%d]\n", cnt);
+  
+    pthread_exit(NULL);
+}
+
+
+//counter with mutex
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#define NUM_CHILDREN 2
+
+void perror_exit (char *s)
+{
+  perror (s);  exit (-1);
+}
+
+void *check_malloc(int size)
+{
+  void *p = malloc (size);
+  if (p == NULL) perror_exit ("malloc failed");
+  return p;
+}
+
+typedef sem_t Semaphore;
+
+Semaphore *make_semaphore (int n)
+{
+  Semaphore *sem = check_malloc (sizeof(Semaphore));
+  int ret = sem_init(sem, 0, n);
+  if (ret == -1) perror_exit ("sem_init failed");
+  return sem;
+}
+
+int sem_signal(Semaphore *sem)
+{
+  return sem_post(sem);
+}
+
+typedef struct {
+  int counter;
+  int end;
+  int *array;
+  Semaphore *mutex;
+} Shared;
+
+Shared *make_shared (int end)
+{
+  int i;
+  Shared *shared = check_malloc (sizeof (Shared));
+
+  shared->counter = 0;
+  shared->end = end;
+
+  shared->array = check_malloc (shared->end * sizeof(int));
+  for (i=0; i<shared->end; i++) {
+    shared->array[i] = 0;
+  }
+  shared->mutex = make_semaphore(1);
+  return shared;
+}
+
+pthread_t make_thread(void *(*entry)(void *), Shared *shared)
+{
+  int ret;
+  pthread_t thread;
+
+  ret = pthread_create (&thread, NULL, entry, (void *) shared);
+  if (ret != 0) perror_exit ("pthread_create failed");
+  return thread;
+}
+
+void join_thread (pthread_t thread)
+{
+  int ret = pthread_join (thread, NULL);
+  if (ret == -1) perror_exit ("pthread_join failed");
+}
+
+void child_code (Shared *shared)
+{
+  printf ("Starting child at counter %d\n", shared->counter);
+
+  while (1) {
+    sem_wait(shared->mutex);
+    if (shared->counter >= shared->end) {
+      sem_signal(shared->mutex);
+      return;
+    }
+
+    shared->array[shared->counter]++;
+    shared->counter++;
+
+    if (shared->counter % 10000 == 0) {
+      printf ("%d\n", shared->counter);
+    }
+    sem_signal(shared->mutex);
+  }
+}
+
+void *entry (void *arg)
+{
+  Shared *shared = (Shared *) arg;
+  child_code (shared);
+  printf ("Child done.\n");
+  pthread_exit (NULL);
+}
+
+void check_array (Shared *shared)
+{
+  int i, errors=0;
+
+  printf ("Checking...\n");
+
+  for (i=0; i<shared->end; i++) {
+    if (shared->array[i] != 1) errors++;
+  }
+  printf ("%d errors.\n", errors);
+}
+
+int main ()
+{
+  int i;
+  pthread_t child[NUM_CHILDREN];
+
+  Shared *shared = make_shared (100000000);
+
+  for (i=0; i NUM_CHILDREN; i++) {
+    child[i] = make_thread (entry, shared);
+  }
+
+  for (i=0; i NUM_CHILDREN; i++) {
+    join_thread (child[i]);
+  }
+
+  check_array (shared);
+  return 0;
+}
+
+
+//Producer consuemer problem 
+#include <stdio.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#define N 5
+#define COUNT 20
+
+int buf[N], in = 0, out = 0;
+sem_t empty, full, mutex;
+
+void* producer(void* arg) {
+    for (int i = 1; i <= COUNT; i++) {
+        sem_wait(&empty);
+        sem_wait(&mutex);
+
+        buf[in] = i;
+        in = (in + 1) % N;
+        printf("Produced %d\n", i);
+
+        sem_post(&mutex);
+        sem_post(&full);
+    }
+    return NULL;
+}
+
+void* consumer(void* arg) {
+    for (int i = 0; i < COUNT; i++) {
+        sem_wait(&full);
+        sem_wait(&mutex);
+
+        int item = buf[out];
+        out = (out + 1) % N;
+        printf("  Consumed %d\n", item);
+
+        sem_post(&mutex);
+        sem_post(&empty);
+    }
+    return NULL;
+}
+
+int main() {
+    pthread_t p, c;
+    sem_init(&empty, 0, N);
+    sem_init(&full, 0, 0);
+    sem_init(&mutex, 0, 1);
+
+    pthread_create(&p, NULL, producer, NULL);
+    pthread_create(&c, NULL, consumer, NULL);
+
+    pthread_join(p, NULL);
+    pthread_join(c, NULL);
+
+    return 0;
+}
+
+//shared memory 
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h> //toupper()
+#include <sys/ipc.h> //IPC key constants
+#include <sys/shm.h> //shmget(), shmat(), shmdt()
+#include <unistd.h> 
+#include <string.h> //strcpy()
+
+#define SHM_SIZE 1024
+
+int main() {
+    int shmid = shmget(IPC_PRIVATE, SHM_SIZE, 0666);
+    char *shm;
+
+    if (fork() == 0) { 
+        shm = shmat(shmid, NULL, 0);
+
+        //busy wait
+        while (shm[0] == '\0'); // wait until parent writes
+
+        for (int i = 0; shm[i] != '\0'; i++)
+            shm[i] = toupper((unsigned char)shm[i]);
+
+        shmdt(shm);
+        exit(0);
+    } 
+    
+    else { // Parent: write & print
+        shm = shmat(shmid, NULL, 0);
+
+        strcpy(shm, "Hello, shared memory!");
+
+        sleep(1); // give child time to process
+
+        printf("Uppercased string: %s\n", shm);
+
+        shmdt(shm);
+    }
+
+    return 0;
+}
+
+
+//p threadds id self 
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <pthread.h>
+
+
+
+void* child_thread(void* arg) {
+
+    printf("%d: hello, my thread id: %d\n", *((int*)arg),  pthread_self());
+
+    return NULL;
+}
+
+
+int main(int argc, char *argv[]) {
+    pthread_t thread[5];
+    
+    for (int i = 0 ; i < 5; i++){
+        pthread_create(&thread[i], NULL, child_thread, &i);
+        
+    }
+
+    for (int i = 0 ; i < 5; i++){
+        pthread_join(thread[i], NULL);    
+    }
+    return 0;
+}
+
+
+//program wait
+#include <stdio.h> 
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+int main(){
+	
+	printf("Task 3\n\n");
+	pid_t p = fork();
+	
+	
+	if (p < 0)
+		printf("Forking Failed\n");
+		
+	else if (p == 0){
+		printf("Child is running at %d....Gonna Sleep for 2 seconds\n", getpid());
+		sleep(2);
+		printf("Child is Done\n\n");
+	}
+	else{
+		int state = 0;
+		if (waitpid(p, &state, 0) != -1){
+			printf("Parent running after child is done\n");
+		}
+	}
+	
+	return 0;
+	
+}
+
+  </code></pre>
+</body>
+</html>
