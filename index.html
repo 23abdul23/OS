@@ -29,6 +29,397 @@
 <body>
   <h2>Example of Inter-Process Communication using Shared Memory in C</h2>
   <pre><code>
+
+/*
+==============================================================
+ 🧠 OS LAB — Synchronization & IPC Programs in One File
+==============================================================
+
+Includes:
+  Q1. Dining Philosophers (pthread_mutex)
+  Q2. Producer–Consumer (unnamed semaphores)
+  Q3. Readers–Writers (semaphore + mutex)
+  Q4. Message Passing (pipes)
+  Q5. Shared Memory Communication
+  Q6. Race Condition Demo (with & without mutex)
+  Q7. Producer–Consumer (named semaphores)
+==============================================================
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/wait.h>
+
+// =====================================================================
+// Q1. Dining Philosophers Problem (Deadlock-Free)
+// =====================================================================
+#define N 5
+pthread_mutex_t forks[N];
+
+void* philosopher(void* num) {
+    int id = *(int*)num;
+    int left = id;
+    int right = (id + 1) % N;
+
+    for (int meals = 0; meals < 3; meals++) { // limit for demo
+        printf("Philosopher %d is thinking 💭\n", id);
+        sleep(1);
+
+        // Even -> right first, Odd -> left first
+        if (id % 2 == 0) {
+            pthread_mutex_lock(&forks[right]);
+            pthread_mutex_lock(&forks[left]);
+        } else {
+            pthread_mutex_lock(&forks[left]);
+            pthread_mutex_lock(&forks[right]);
+        }
+
+        printf("Philosopher %d is eating 🍝\n", id);
+        sleep(1);
+
+        pthread_mutex_unlock(&forks[left]);
+        pthread_mutex_unlock(&forks[right]);
+        printf("Philosopher %d finished eating 💤\n", id);
+    }
+    return NULL;
+}
+
+void run_dining_philosophers() {
+    pthread_t threads[N];
+    int ids[N];
+    for (int i = 0; i < N; i++) pthread_mutex_init(&forks[i], NULL);
+    for (int i = 0; i < N; i++) {
+        ids[i] = i;
+        pthread_create(&threads[i], NULL, philosopher, &ids[i]);
+    }
+    for (int i = 0; i < N; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < N; i++) pthread_mutex_destroy(&forks[i]);
+}
+
+// =====================================================================
+// Q2. Producer–Consumer Problem (Unnamed Semaphores)
+// =====================================================================
+#define BUFFER_SIZE 5
+#define NUM_ITEMS 10
+
+int buffer[BUFFER_SIZE];
+int in = 0, out = 0;
+sem_t empty, full;
+pthread_mutex_t mutex;
+
+void* producer(void* a) {
+    for (int i = 1; i <= NUM_ITEMS; i++) {
+        sem_wait(&empty);
+        pthread_mutex_lock(&mutex);
+        buffer[in] = i;
+        printf("Produced: %d\n", i);
+        in = (in + 1) % BUFFER_SIZE;
+        pthread_mutex_unlock(&mutex);
+        sem_post(&full);
+        sleep(1);
+    }
+    return NULL;
+}
+
+void* consumer(void* a) {
+    for (int i = 1; i <= NUM_ITEMS; i++) {
+        sem_wait(&full);
+        pthread_mutex_lock(&mutex);
+        int item = buffer[out];
+        printf("Consumed: %d\n", item);
+        out = (out + 1) % BUFFER_SIZE;
+        pthread_mutex_unlock(&mutex);
+        sem_post(&empty);
+        sleep(1);
+    }
+    return NULL;
+}
+
+void run_producer_consumer() {
+    pthread_t prod, cons;
+    sem_init(&empty, 0, BUFFER_SIZE);
+    sem_init(&full, 0, 0);
+    pthread_mutex_init(&mutex, NULL);
+    pthread_create(&prod, NULL, producer, NULL);
+    pthread_create(&cons, NULL, consumer, NULL);
+    pthread_join(prod, NULL);
+    pthread_join(cons, NULL);
+    sem_destroy(&empty);
+    sem_destroy(&full);
+    pthread_mutex_destroy(&mutex);
+}
+
+// =====================================================================
+// Q3. Readers–Writers Problem
+// =====================================================================
+sem_t wrt;
+pthread_mutex_t rw_mutex;
+int readcount = 0;
+int data = 0;
+
+void* reader(void* arg) {
+    int id = *(int*)arg;
+    for (int i = 0; i < 3; i++) {
+        pthread_mutex_lock(&rw_mutex);
+        readcount++;
+        if (readcount == 1) sem_wait(&wrt);
+        pthread_mutex_unlock(&rw_mutex);
+
+        printf("Reader %d reads data = %d 📖\n", id, data);
+        sleep(1);
+
+        pthread_mutex_lock(&rw_mutex);
+        readcount--;
+        if (readcount == 0) sem_post(&wrt);
+        pthread_mutex_unlock(&rw_mutex);
+    }
+    return NULL;
+}
+
+void* writer(void* arg) {
+    int id = *(int*)arg;
+    for (int i = 0; i < 3; i++) {
+        sem_wait(&wrt);
+        data++;
+        printf("Writer %d modified data to %d ✍\n", id, data);
+        sleep(1);
+        sem_post(&wrt);
+    }
+    return NULL;
+}
+
+void run_readers_writers() {
+    pthread_t rtid[3], wtid[2];
+    int rid[3], wid[2];
+    sem_init(&wrt, 0, 1);
+    pthread_mutex_init(&rw_mutex, NULL);
+
+    for (int i = 0; i < 3; i++) {
+        rid[i] = i + 1;
+        pthread_create(&rtid[i], NULL, reader, &rid[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        wid[i] = i + 1;
+        pthread_create(&wtid[i], NULL, writer, &wid[i]);
+    }
+    for (int i = 0; i < 3; i++) pthread_join(rtid[i], NULL);
+    for (int i = 0; i < 2; i++) pthread_join(wtid[i], NULL);
+    sem_destroy(&wrt);
+    pthread_mutex_destroy(&rw_mutex);
+}
+
+// =====================================================================
+// Q4. Message Passing with Pipes
+// =====================================================================
+void run_pipes() {
+    int fd1[2], fd2[2];
+    pipe(fd1);
+    pipe(fd2);
+
+    if (fork() == 0) {
+        close(fd1[1]);
+        close(fd2[0]);
+        int arr[5];
+        read(fd1[0], arr, sizeof(arr));
+        int sum = 0;
+        for (int i = 0; i < 5; i++) sum += arr[i];
+        write(fd2[1], &sum, sizeof(sum));
+        exit(0);
+    } else {
+        close(fd1[0]);
+        close(fd2[1]);
+        int arr[5] = {1, 2, 3, 4, 5}, sum;
+        write(fd1[1], arr, sizeof(arr));
+        read(fd2[0], &sum, sizeof(sum));
+        printf("Sum received from child: %d\n", sum);
+        wait(NULL);
+    }
+}
+
+// =====================================================================
+// Q5. Shared Memory Communication
+// =====================================================================
+void run_shared_memory() {
+    int shmid = shmget(IPC_PRIVATE, 1024, 0666 | IPC_CREAT);
+    char* str = (char*)shmat(shmid, NULL, 0);
+
+    if (fork() == 0) {
+        sleep(1);
+        for (int i = 0; str[i]; i++)
+            str[i] = toupper(str[i]);
+        printf("Child: Uppercase: %s\n", str);
+        shmdt(str);
+        exit(0);
+    } else {
+        strcpy(str, "hello shared memory");
+        printf("Parent: Wrote string: %s\n", str);
+        wait(NULL);
+        shmdt(str);
+        shmctl(shmid, IPC_RMID, NULL);
+    }
+}
+
+// =====================================================================
+// Q6. Race Condition Demo
+// =====================================================================
+int counter = 0;
+pthread_mutex_t lock;
+
+void* inc_no_sync(void* arg) {
+    for (int i = 0; i < 100000; i++) counter++;
+    return NULL;
+}
+
+void* inc_with_mutex(void* arg) {
+    for (int i = 0; i < 100000; i++) {
+        pthread_mutex_lock(&lock);
+        counter++;
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
+}
+
+void run_race_condition() {
+    pthread_t t1, t2;
+
+    // (a) Without Mutex
+    counter = 0;
+    pthread_create(&t1, NULL, inc_no_sync, NULL);
+    pthread_create(&t2, NULL, inc_no_sync, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("Counter (no mutex): %d\n", counter);
+
+    // (b) With Mutex
+    counter = 0;
+    pthread_mutex_init(&lock, NULL);
+    pthread_create(&t1, NULL, inc_with_mutex, NULL);
+    pthread_create(&t2, NULL, inc_with_mutex, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("Counter (with mutex): %d\n", counter);
+    pthread_mutex_destroy(&lock);
+}
+
+// =====================================================================
+// Q7. Producer–Consumer Problem (Named Semaphores)
+// =====================================================================
+#define ITEMS_PER_PROD 5
+sem_t *empty_named, *full_named, *mutex_named;
+int buf2[BUFFER_SIZE];
+int in2 = 0, out2 = 0, count2 = 0;
+
+void* named_producer(void* arg) {
+    int id = *(int*)arg;
+    for (int i = 1; i <= ITEMS_PER_PROD; i++) {
+        int item = id * 100 + i;
+        sem_wait(empty_named);
+        sem_wait(mutex_named);
+        buf2[in2] = item;
+        in2 = (in2 + 1) % BUFFER_SIZE;
+        count2++;
+        printf("P%d produced %d\n", id, item);
+        fflush(stdout);
+        sem_post(mutex_named);
+        sem_post(full_named);
+        usleep(200000);
+    }
+    return NULL;
+}
+
+void* named_consumer(void* arg) {
+    int id = *(int*)arg;
+    for (int i = 0; i < ITEMS_PER_PROD * 3; i++) {
+        sem_wait(full_named);
+        sem_wait(mutex_named);
+        if (count2 == 0) {
+            sem_post(mutex_named);
+            sem_post(full_named);
+            break;
+        }
+        int item = buf2[out2];
+        out2 = (out2 + 1) % BUFFER_SIZE;
+        count2--;
+        printf("C%d consumed %d\n", id, item);
+        fflush(stdout);
+        sem_post(mutex_named);
+        sem_post(empty_named);
+        usleep(300000);
+    }
+    return NULL;
+}
+
+void run_named_sem() {
+    empty_named = sem_open("/empty_sem", O_CREAT, 0644, BUFFER_SIZE);
+    full_named  = sem_open("/full_sem",  O_CREAT, 0644, 0);
+    mutex_named = sem_open("/mutex_sem", O_CREAT, 0644, 1);
+
+    int np = 3, nc = 2;
+    pthread_t prod[np], cons[nc];
+    int ids[np + nc];
+    for (int i = 0; i < np; i++) ids[i] = i + 1;
+    for (int i = 0; i < nc; i++) ids[np + i] = i + 1;
+
+    for (int i = 0; i < np; i++) pthread_create(&prod[i], NULL, named_producer, &ids[i]);
+    for (int i = 0; i < nc; i++) pthread_create(&cons[i], NULL, named_consumer, &ids[np + i]);
+
+    for (int i = 0; i < np; i++) pthread_join(prod[i], NULL);
+    for (int i = 0; i < nc; i++) pthread_join(cons[i], NULL);
+
+    sem_close(empty_named);
+    sem_close(full_named);
+    sem_close(mutex_named);
+    sem_unlink("/empty_sem");
+    sem_unlink("/full_sem");
+    sem_unlink("/mutex_sem");
+
+    printf("Named Semaphore Demo Done ✅\n");
+}
+
+// =====================================================================
+// MAIN MENU
+// =====================================================================
+int main() {
+    int choice;
+    while (1) {
+        printf("\n================ OS LAB MENU ================\n");
+        printf("1. Dining Philosophers\n");
+        printf("2. Producer–Consumer (Unnamed Semaphores)\n");
+        printf("3. Readers–Writers Problem\n");
+        printf("4. Message Passing (Pipes)\n");
+        printf("5. Shared Memory Communication\n");
+        printf("6. Race Condition Demo\n");
+        printf("7. Producer–Consumer (Named Semaphores)\n");
+        printf("0. Exit\n");
+        printf("Enter choice: ");
+        scanf("%d", &choice);
+        printf("============================================\n");
+
+        switch (choice) {
+            case 1: run_dining_philosophers(); break;
+            case 2: run_producer_consumer(); break;
+            case 3: run_readers_writers(); break;
+            case 4: run_pipes(); break;
+            case 5: run_shared_memory(); break;
+            case 6: run_race_condition(); break;
+            case 7: run_named_sem(); break;
+            case 0: printf("Goodbye 👋\n"); exit(0);
+            default: printf("Invalid choice.\n");
+        }
+    }
+    return 0;
+}
+
+    
 // Example of Inter-Process Communication using Shared Memory in C
 //Part 1 is done and the file is Data.json
 
