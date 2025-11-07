@@ -30,72 +30,258 @@
   <h2>Example of Inter-Process Communication using Shared Memory in C</h2>
   <pre><code>
 // Example of Inter-Process Communication using Shared Memory in C
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;sys/types.h&gt; //fork()
-#include &lt;ctype.h&gt; //toupper()
-#include &lt;sys/ipc.h&gt; //IPC key constants
-#include &lt;sys/shm.h&gt; //shmget(), shmat(), shmdt()
-#include &lt;unistd.h&gt;
-#include &lt;string.h&gt; //strcpy()
-#include "cJSON.h" // Assuming cJSON.h is in your include path
+//Part 1 is done and the file is Data.json
 
-#define SHM_SIZE 1024
 
-int main() {
-    int shmid = shmget(IPC_PRIVATE, SHM_SIZE, 0666);
-    char *shm;
-    FILE *fp;
-    long lSize;
-    char *buffer;
+//Part 2
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <wait.h>
+#include <string.h>
 
-    if (fork() == 0) {
-        shm = shmat(shmid, NULL, 0);
-        // busy wait
-        while (shm[0] == '\0'); // wait until parent writes
+#include <cjson/cJSON.h> 
 
-        printf("%s", shm);
-        shmdt(shm);
-        exit(0);
-    } else { // Parent: write & print
-        shm = shmat(shmid, NULL, 0);
 
-        fp = fopen("data.json", "rb"); // Open the file in binary read mode
-        if (!fp) {
-            perror("Error opening file");
-            return 1;
-        }
+#define SEM_SEARCH 0
+#define SEM_UPDATE 1
+#define SEM_DATABASE 2
 
-        fseek(fp, 0L, SEEK_END);
-        lSize = ftell(fp);
-        rewind(fp);
+#define NUM_SEARCH 5
 
-        buffer = (char*) malloc(lSize + 1);
-        if (!buffer) {
-            fclose(fp);
-            perror("Memory allocation failed");
-            return 1;
-        }
+char *shm;
+FILE *fp;
+long lSize;
+char *buffer;
+int shmid;
+int semid;
 
-        if (fread(buffer, lSize, 1, fp) != 1) {
-            fclose(fp);
-            free(buffer);
-            perror("Error reading file");
-            return 1;
-        }
+key_t shmkey;
+key_t semkey;
 
-        buffer[lSize] = '\0';
-        fclose(fp);
 
-        strcpy(shm, buffer);
-        free(buffer);
-        shmdt(shm);
+int create_database(){
+    fp = fopen("Data.json", "rb"); 
+    if (!fp) {
+        perror("Error opening file");
+        return 1;
     }
 
+    fseek(fp, 0L, SEEK_END); 
+    lSize = ftell(fp);       
+    rewind(fp);              
+
+    
+    
+    buffer = (char*) malloc(lSize + 2);
+    if (!buffer) {
+        fclose(fp);
+        perror("Memory allocation failed");
+        return 1;
+    }
+
+    // Read the file into the buffer
+    if (fread(buffer, lSize, 1, fp) != 1) {
+        fclose(fp);
+        free(buffer);
+        perror("Error reading file");
+        return 1;
+    }
+    buffer[lSize] = '\0'; 
+
+    fclose(fp); 
+
+    shmid = shmget(IPC_PRIVATE, lSize+1, 0666);
+    if (shmid == -1) {
+        perror("shmget failed");
+        free(buffer);
+        return 1;
+    }
+    return 0;
+}
+
+int update_ratings(char *shm) {
+    cJSON *json = cJSON_Parse(shm);
+    if (!cJSON_IsArray(json)) {
+        printf("DEBUG: JSON starts with: %.40s\n", shm);
+        printf("Error: JSON not an array!\n");
+        cJSON_Delete(json);
+        return 0;
+    }
+
+    int size = cJSON_GetArraySize(json);
+    for (int i = 0; i < size; i += 100) {
+        cJSON *movie = cJSON_GetArrayItem(json, i);
+        if (movie) {
+            cJSON *rating = cJSON_GetObjectItemCaseSensitive(movie, "Rating");
+            if (cJSON_IsNumber(rating)) {
+                rating->valuedouble += 0.3;
+            }
+        }
+    }
+
+    // Convert JSON back to string and overwrite shared memory
+    char *updated = cJSON_PrintUnformatted(json);
+    strcpy(shm, updated);
+    free(updated);
+
+    printf("Update process %d finished updating ratings.\n", getpid());
+    cJSON_Delete(json);
+    return 0;
+}
+
+// comparator for qsort: sort by decreasing Rating
+static int cmp_desc_rating(const void *a, const void *b){
+    cJSON *const *pa = (cJSON *const *)a;
+    cJSON *const *pb = (cJSON *const *)b;
+    cJSON *ra = cJSON_GetObjectItemCaseSensitive(*pa, "Rating");
+    cJSON *rb = cJSON_GetObjectItemCaseSensitive(*pb, "Rating");
+    double va = (cJSON_IsNumber(ra) ? ra->valuedouble : 0.0);
+    double vb = (cJSON_IsNumber(rb) ? rb->valuedouble : 0.0);
+    if (va < vb) return 1;
+    if (va > vb) return -1;
+    return 0;
+}
+
+int search_movie(char *shm, char *keyword){
+    cJSON *json = cJSON_Parse(shm);
+    cJSON *ans[1000];
+    int idx = 0;
+
+    if (cJSON_IsArray(json)) {
+        int size = cJSON_GetArraySize(json);
+        
+        for (int i = 0; i < size; i++){
+            cJSON *first_item = cJSON_GetArrayItem(json, i);
+            if (first_item) {
+                cJSON *overview = cJSON_GetObjectItemCaseSensitive(first_item, "Overview");
+                if (overview && cJSON_IsString(overview) && strstr(overview->valuestring, keyword) != NULL){
+                    ans[idx++] = first_item;
+                }
+            }
+        }
+
+        // sort answers by decreasing Rating
+        if (idx > 1) {
+            qsort(ans, idx, sizeof(cJSON *), cmp_desc_rating);
+        }
+
+        for (int i = 0; i < idx; i++){
+            cJSON *item = ans[i];
+            if (item) {
+                cJSON *title = cJSON_GetObjectItemCaseSensitive(item, "Title");
+                cJSON *director = cJSON_GetObjectItemCaseSensitive(item, "Director");
+                cJSON *year = cJSON_GetObjectItemCaseSensitive(item, "Year");
+                cJSON *rating = cJSON_GetObjectItemCaseSensitive(item, "Rating");
+                cJSON *overview = cJSON_GetObjectItemCaseSensitive(item, "Overview");
+
+                if (cJSON_IsString(title) && title->valuestring != NULL) {
+                    printf("Title: %s\n", title->valuestring);
+                    if (cJSON_IsString(director) && director->valuestring) printf("Director: %s\n", director->valuestring);
+                    if (cJSON_IsString(year) && year->valuestring) printf("Year: %s\n", year->valuestring);
+                    if (cJSON_IsNumber(rating)) printf("Rating: %.2f\n", rating->valuedouble);
+                    if (cJSON_IsString(overview) && overview->valuestring) printf("Overview: %s\n", overview->valuestring);
+                    printf("\n-------------------------------------------------------\n");
+                }
+            }
+        }
+
+        printf("Process: %d searched %s : %d\n",getpid(), keyword, idx);
+    }
+    cJSON_Delete(json);
     return 0;
 }
 
 
+void sem_op_wait(int semid, int semnum){
+    struct sembuf sb = {semnum, -1, 0};
+    semop(semid, &sb, 1);
+}
+
+void sem_op_signal(int semid, int semnum){
+    struct sembuf sb = {semnum, 1, 0};
+    semop(semid, &sb, 1);
+}
+
+
+int main(){
+    // use an existing path for ftok to avoid ENOENT
+    semkey = ftok("/tmp", 65);
+    shmkey = ftok("/tmp", 75);
+
+    semid = semget(semkey, 3, 0666 | IPC_CREAT);
+
+
+    semctl(semid, SEM_SEARCH, SETVAL, 5);
+    semctl(semid, SEM_UPDATE, SETVAL, 1);
+    semctl(semid, SEM_DATABASE, SETVAL, 0); //0 for DB not created yet
+
+    pid_t p_search, p_update;
+
+    
+    if (create_database() != 0) {
+        return 1; // Error occurred in create_database
+    }
+    shm = shmat(shmid, NULL, 0);
+    strcpy(shm, buffer);
+    shm[lSize] = '\0';  // Ensure null termination
+    
+    
+    sem_op_signal(semid, SEM_DATABASE); // signal that DB is ready
+    
+
+
+   for (int i = 0; i < NUM_SEARCH; i++){
+        p_search = fork();
+        if (p_search == 0){
+            sem_op_wait(semid, SEM_DATABASE);
+            // return SEM_DATABASE value for others
+            sem_op_signal(semid, SEM_DATABASE);
+
+            sem_op_wait(semid, SEM_SEARCH);
+            
+            char *keyword = "";
+            if (i % 3 == 0)
+                keyword = "love";
+            else if (i % 3 == 1)
+                keyword = "action";
+            else
+                keyword = "drama";
+
+            search_movie(shm, keyword);
+
+            sem_op_signal(semid, SEM_SEARCH);
+            exit(0);
+        }
+    }
+
+    p_update = fork();
+    if (p_update == 0){
+
+        sem_op_wait(semid, SEM_DATABASE);
+        sem_op_signal(semid, SEM_DATABASE);
+
+        sem_op_wait(semid, SEM_UPDATE);
+
+        update_ratings(shm);
+
+        sem_op_signal(semid, SEM_UPDATE);
+        exit(0);
+    }
+
+
+    free(buffer);
+    shmdt(shm);
+
+
+    shmctl(shmid, IPC_RMID, NULL);
+    semctl(semid, 0, IPC_RMID);
+    return 0;
+}
 
 //good counter using mutex and semaphore
 #include <pthread.h>
